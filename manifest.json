@@ -1,0 +1,8 @@
+{
+  "name": "Camelot",
+  "description": "Shows BPM, key and Camelot notation on every track row and the now-playing bar.",
+  "main": "camelot.js",
+  "readme": "README.md",
+  "authors": [{ "name": "rlaisqls", "url": "https://github.com/rlaisqls" }],
+  "tags": ["bpm", "key", "camelot", "dj", "mix"]
+}
