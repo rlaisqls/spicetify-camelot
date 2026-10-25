@@ -34,6 +34,13 @@
     repTopK: 8, // number of most similar repetitions averaged in (0 = off)
     repThreshold: 0.5, // minimum context similarity for a repetition
     repWeight: 2, // weight of the averaged repetitions relative to the window itself
+    // Local keys (Viterbi over chords, in seconds of chord time)
+    keySwitch: 12, // cost of a modulation: the new key must fit ~this many seconds better
+    keyHintBonus: 0.1, // per-second bonus for a Mix track key (audio-analysis keys are too often wrong to favor)
+    // Fit per second of chord time: diatonic = 1, anything else not listed = -1
+    keyTonicFit: 2, // the tonic triad
+    keyBorrowedFit: 0.3, // common borrowed chords (♭VII, iv…)
+    keySecondaryFit: -0.3, // secondary dominants (V/x of a diatonic chord)
   };
   const LOW_CONFIDENCE = 0.4;
 
@@ -592,6 +599,103 @@
     return hints;
   }
 
+  // Chord names for a set of played notes (piano), beyond the triads the estimator knows
+  const QUALITIES = [
+    ["", [0, 4, 7]],
+    ["m", [0, 3, 7]],
+    ["7", [0, 4, 7, 10]],
+    ["maj7", [0, 4, 7, 11]],
+    ["m7", [0, 3, 7, 10]],
+    ["dim", [0, 3, 6]],
+    ["aug", [0, 4, 8]],
+    ["sus4", [0, 5, 7]],
+    ["sus2", [0, 2, 7]],
+    ["m7♭5", [0, 3, 6, 10]],
+    ["dim7", [0, 3, 6, 9]],
+    ["6", [0, 4, 7, 9]],
+    ["m6", [0, 3, 7, 9]],
+    ["5", [0, 7]],
+  ];
+  const MINORISH = new Set(["m", "m7", "dim", "m7♭5", "dim7", "m6"]);
+  const ROMAN_SUFFIX = { dim: "°", aug: "+", "m7♭5": "ø7", dim7: "°7", m7: "7", m6: "6" };
+
+  // MIDI notes → { root, quality, bass, chord (triad index or -1) } or null; inversions keep the bass
+  function identifyChord(midis) {
+    if (!midis.length) return null;
+    const bass = Math.min(...midis) % 12;
+    const pcs = [...new Set(midis.map((m) => m % 12))];
+    const roots = [bass, ...pcs.filter((p) => p !== bass)];
+    for (const root of roots) {
+      const set = pcs.map((p) => (p - root + 12) % 12).sort((a, b) => a - b).join(",");
+      const q = QUALITIES.find(([, iv]) => iv.join(",") === set);
+      if (q) return { root, quality: q[0], bass, chord: q[0] === "" ? root * 2 : q[0] === "m" ? root * 2 + 1 : -1 };
+    }
+    return null;
+  }
+  function chordLabel({ root, quality, bass }, tonic, minorKey) {
+    const names = tonic != null && usesFlats(tonic, minorKey) ? FLAT_PITCHES : PITCHES;
+    return `${names[root]}${quality}${bass !== root ? `/${names[bass]}` : ""}`;
+  }
+  function romanOf({ root, quality }, tonic, minorKey) {
+    if (tonic == null || tonic < 0) return "";
+    const r = (minorKey ? ROMAN_MINOR : ROMAN_MAJOR)[(root - tonic + 12) % 12];
+    return `${MINORISH.has(quality) ? r.toLowerCase() : r}${ROMAN_SUFFIX[quality] ?? (quality === "m" ? "" : quality)}`;
+  }
+
+  // How well a chord fits key k (= tonic * 2 + minor), per second of chord time
+  function keyFit(chord, k) {
+    const tonic = k >> 1;
+    const minorKey = (k & 1) === 1;
+    if (degreeOf(chord, tonic) === 0 && CHORDS[chord].minor === minorKey) return PARAMS.keyTonicFit;
+    const diatonic = diatonicSet(tonic, minorKey);
+    if (diatonic.has(chord)) return 1;
+    if ((minorKey ? BORROWED_MINOR : BORROWED_MAJOR)[chordKey(chord, tonic)]) return PARAMS.keyBorrowedFit;
+    const { root, minor } = CHORDS[chord];
+    const target = (root + 5) % 12;
+    if (!minor && target !== tonic && [...diatonic].some((c) => CHORDS[c].root === target)) return PARAMS.keySecondaryFit;
+    return -1;
+  }
+
+  // Key regions [[start, end, tonic, minor]]: Viterbi over the chord sequence, where staying in a key
+  // is free and modulating costs PARAMS.keySwitch seconds of fit. The track key gets a small bonus,
+  // so short excursions (secondary dominants, borrowed chords) stay explained within the main key.
+  function localKeys(spans, tonic, minorKey, hintBonus = PARAMS.keyHintBonus) {
+    const seq = mergeSpans(spans).filter(([, , c]) => c >= 0);
+    if (!seq.length) return [];
+    const hint = tonic == null || tonic < 0 ? -1 : tonic * 2 + (minorKey ? 1 : 0);
+    const emit = ([s, e, c]) =>
+      Array.from({ length: 24 }, (_, k) => (keyFit(c, k) + (k === hint ? hintBonus : 0)) * (e - s));
+    let score = emit(seq[0]);
+    const back = [];
+    for (let t = 1; t < seq.length; t++) {
+      let best = 0;
+      for (let k = 1; k < 24; k++) if (score[k] > score[best]) best = k;
+      const switched = score[best] - PARAMS.keySwitch;
+      const e = emit(seq[t]);
+      const from = new Int8Array(24);
+      score = score.map((v, k) => {
+        from[k] = v >= switched ? k : best;
+        return Math.max(v, switched) + e[k];
+      });
+      back.push(from);
+    }
+    let k = score.indexOf(Math.max(...score));
+    const path = [k];
+    for (let t = back.length; t > 0; t--) path.unshift((k = back[t - 1][k]));
+    // Regions cover the whole track, including no-chord gaps
+    const regions = [];
+    path.forEach((key, t) => {
+      const last = regions[regions.length - 1];
+      if (last && last[2] * 2 + (last[3] ? 1 : 0) === key) last[1] = seq[t][1];
+      else regions.push([last ? seq[t][0] : Math.min(seq[t][0], spans[0][0]), seq[t][1], key >> 1, (key & 1) === 1]);
+    });
+    regions.forEach((r, i) => (r[1] = regions[i + 1]?.[0] ?? Math.max(r[1], spans[spans.length - 1][1])));
+    return regions;
+  }
+  const keyRegions = (res, spans = res.spans) =>
+    localKeys(spans, res.tonic, res.minor, res.keySrc === "audio-analysis" ? 0 : PARAMS.keyHintBonus);
+  const keyAt = (regions, t) => regions.find(([s, e]) => t >= s && t < e) ?? regions[regions.length - 1];
+
   // ---- corrections ----
 
   // User fixes are stored as time ranges [start, end, chord] so they survive estimator changes
@@ -649,17 +753,37 @@
     (id) => `https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${id}?format=json`,
     (id) => `https://api.spotify.com/v1/audio-analysis/${id}`,
   ];
-  async function fetchChords(id) {
-    let data = null;
+  // Segment chroma for the piano view, kept in memory only (too big for localStorage):
+  // id → { starts: Float64Array, pitches: Uint8Array (12 per segment, 0–255) }
+  const pitchCache = new Map();
+  const PITCH_CACHE_LIMIT = 3;
+  function keepPitches(id, segments) {
+    const starts = Float64Array.from(segments, (s) => s.start);
+    const pitches = new Uint8Array(segments.length * 12);
+    segments.forEach((s, i) => s.pitches?.forEach((p, d) => (pitches[i * 12 + d] = Math.round(p * 255))));
+    pitchCache.delete(id);
+    pitchCache.set(id, { starts, pitches });
+    while (pitchCache.size > PITCH_CACHE_LIMIT) pitchCache.delete(pitchCache.keys().next().value);
+  }
+
+  async function fetchAnalysis(id) {
     for (const url of ANALYSIS_URLS) {
       try {
-        data = await getJSON(url(id));
-        if (data?.segments?.length) break;
+        const data = await getJSON(url(id));
+        if (data?.segments?.length) {
+          keepPitches(id, data.segments);
+          return data;
+        }
       } catch (e) {
         console.debug(TAG, "analysis", e);
       }
     }
-    if (!data?.segments?.length) return null; // not cached, so the next open retries
+    return null;
+  }
+
+  async function fetchChords(id) {
+    const data = await fetchAnalysis(id);
+    if (!data) return null; // not cached, so the next open retries
     // Prefer the Mix key (more reliable than audio-analysis, see README)
     const feat = cache.get(id);
     const pc = pitchClassOf(feat?.n);
@@ -711,6 +835,12 @@
   // Synthesized chord: bass root plus a close-position triad, E2–D♯3 / E3–D♯4 so every key sits in the same range
   let audioCtx = null;
   let voices = [];
+  let sounding = []; // synthesized notes for the piano view: { midi, from, to } in audioCtx time
+  const ctx = () => {
+    audioCtx ??= new AudioContext();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  };
   function stopSynth() {
     for (const v of voices) {
       try {
@@ -718,16 +848,20 @@
       } catch {}
     }
     voices = [];
+    sounding = [];
   }
-  function synthChord(chord, when = 0, dur = 1.2) {
-    if (chord < 0) return;
-    audioCtx ??= new AudioContext();
-    if (audioCtx.state === "suspended") audioCtx.resume();
-    const t0 = audioCtx.currentTime + when;
+  const voicing = (chord) => {
     const { root, minor } = CHORDS[chord];
     const base = 52 + ((root - 4 + 12) % 12);
-    const midis = [base - 12, base, base + (minor ? 3 : 4), base + 7];
+    return [base - 12, base, base + (minor ? 3 : 4), base + 7];
+  };
+  function synthChord(chord, when = 0, dur = 1.2) {
+    if (chord < 0) return;
+    const t0 = ctx().currentTime + when;
+    const midis = voicing(chord);
+    sounding = sounding.filter((n) => n.to > audioCtx.currentTime);
     midis.forEach((m) => {
+      sounding.push({ midi: m, from: t0, to: t0 + dur });
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
       osc.type = "triangle";
@@ -741,6 +875,37 @@
       voices.push(osc);
     });
   }
+  // A held piano note; returns a function that releases it
+  function noteOn(midi) {
+    const ac = ctx();
+    const t0 = ac.currentTime;
+    const gain = ac.createGain();
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(0.12, t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.04, t0 + 1.2);
+    gain.connect(ac.destination);
+    const oscs = [
+      ["triangle", 1, 1],
+      ["sine", 2, 0.3],
+    ].map(([type, mult, level]) => {
+      const osc = ac.createOscillator();
+      const g = ac.createGain();
+      osc.type = type;
+      osc.frequency.value = 440 * 2 ** ((midi - 69) / 12) * mult;
+      g.gain.value = level;
+      osc.connect(g).connect(gain);
+      osc.start(t0);
+      return osc;
+    });
+    return () => {
+      const t = ac.currentTime;
+      gain.gain.cancelScheduledValues(t);
+      gain.gain.setValueAtTime(Math.max(gain.gain.value, 0.0001), t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+      oscs.forEach((o) => o.stop(t + 0.3));
+    };
+  }
+
   // One chord per bar at the track tempo (clamped so very slow/fast tracks stay listenable)
   function synthProgression(chords, bpm) {
     stopSynth();
@@ -800,6 +965,7 @@
 
   let page = null;
   let pageTimer = null;
+  let piano = null;
   const onPageKey = (e) => e.key === "Escape" && closeHarmonyPage();
 
   function closeHarmonyPage() {
@@ -809,6 +975,8 @@
     loopEnabled = false;
     stopSynth();
     document.removeEventListener("keydown", onPageKey);
+    piano?.destroy();
+    piano = null;
     page?.remove();
     page = null;
   }
@@ -836,7 +1004,201 @@
       return;
     }
     loopEnabled = false;
-    drawHarmony({ root, body, id, res, meta, ui: { edit: false, loop: false, sel: null } });
+    const view = { root, body, id, res, meta, ui: { edit: false, loop: false, sel: null } };
+    drawHarmony(view);
+    piano = createPiano(view);
+    root.appendChild(piano.el);
+    // Chords may come from the cache without the (memory-only) segment chroma; fetch it for the piano
+    if (!pitchCache.has(id)) fetchAnalysis(id);
+  }
+
+  // ---- piano ----
+
+  const PIANO_LOW = 36; // C2
+  const PIANO_HIGH = 72; // C5
+  const BLACK_KEYS = new Set([1, 3, 6, 8, 10]);
+  // Physical keys (KeyboardEvent.code, so it works with any input language) → semitones above the playing C
+  const KEYMAP = {
+    KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6, KeyG: 7, KeyY: 8, KeyH: 9,
+    KeyU: 10, KeyJ: 11, KeyK: 12, KeyO: 13, KeyL: 14, KeyP: 15, Semicolon: 16, Quote: 17,
+  };
+  const keyCap = (code) => ({ Semicolon: ";", Quote: "'" })[code] ?? code.slice(3);
+  const SCALES = { major: [0, 2, 4, 5, 7, 9, 11], minor: [0, 2, 3, 5, 7, 8, 10] };
+  const noteName = (midi, tonic, minorKey) =>
+    `${(tonic != null && usesFlats(tonic, minorKey) ? FLAT_PITCHES : PITCHES)[midi % 12]}${Math.floor(midi / 12) - 1}`;
+
+  // Sticky keyboard at the bottom of the harmony page. Shows the estimated chord (voiced like ♪), the
+  // live pitch-class energy of the current segment, scale degrees of the local key, and plays what you press.
+  // view.spans / view.regions / view.mainKey are refreshed by drawHarmony.
+  function createPiano(view) {
+    const el = make("div", "bpmkey-piano");
+    const head = make("div", "bpmkey-piano-head");
+    const now = make("span", "bpmkey-piano-now");
+    const you = make("span", "bpmkey-piano-you");
+    const toggle = make("button", "bpmkey-tool", "▾ Piano");
+    toggle.title = "Show/hide the piano";
+    head.append(now, you, toggle);
+    const keysEl = make("div", "bpmkey-piano-keys");
+    el.append(head, keysEl);
+    toggle.onclick = () => {
+      keysEl.hidden = !keysEl.hidden;
+      toggle.textContent = keysEl.hidden ? "▸ Piano" : "▾ Piano";
+    };
+
+    const keys = new Map(); // midi → { el, degree, cap }
+    const whites = [];
+    for (let m = PIANO_LOW; m <= PIANO_HIGH; m++) if (!BLACK_KEYS.has(m % 12)) whites.push(m);
+    const w = 100 / whites.length;
+    for (let m = PIANO_LOW; m <= PIANO_HIGH; m++) {
+      const black = BLACK_KEYS.has(m % 12);
+      const k = make("div", black ? "bpmkey-key bpmkey-key-black" : "bpmkey-key");
+      const before = whites.filter((x) => x < m).length;
+      k.style.left = `${black ? (before - 0.3) * w : before * w}%`;
+      k.style.width = `${black ? w * 0.6 : w}%`;
+      k.dataset.midi = String(m);
+      const cap = make("small", "bpmkey-key-cap");
+      const degree = make("small", "bpmkey-key-degree");
+      k.append(cap, degree);
+      if (m % 12 === 0) k.appendChild(make("small", "bpmkey-key-octave", `C${m / 12 - 1}`));
+      keys.set(m, { el: k, degree, cap });
+      keysEl.appendChild(k);
+    }
+
+    // Held notes by source ("pointer", "KeyA"…) so key-up releases the right one
+    const held = new Map();
+    let octave = 48; // the A key plays C3
+    const press = (src, midi) => {
+      if (held.has(src) || midi < PIANO_LOW - 12 || midi > PIANO_HIGH + 12) return;
+      held.set(src, { midi, release: noteOn(midi) });
+    };
+    const release = (src) => {
+      held.get(src)?.release();
+      held.delete(src);
+    };
+    const releaseAll = () => [...held.keys()].forEach(release);
+
+    const midiAt = (x, y) => Number(document.elementFromPoint(x, y)?.closest?.(".bpmkey-key")?.dataset.midi) || null;
+    let dragging = false;
+    keysEl.addEventListener("pointerdown", (e) => {
+      const m = midiAt(e.clientX, e.clientY);
+      if (!m) return;
+      e.preventDefault();
+      dragging = true;
+      press("pointer", m);
+    });
+    const onPointerMove = (e) => {
+      if (!dragging) return;
+      const m = midiAt(e.clientX, e.clientY);
+      if (m && m !== held.get("pointer")?.midi) {
+        release("pointer");
+        press("pointer", m);
+      }
+    };
+    const onPointerUp = () => {
+      dragging = false;
+      release("pointer");
+    };
+
+    const ignore = (e) => e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|SELECT|TEXTAREA)$/.test(e.target?.tagName ?? "");
+    const onKeyDown = (e) => {
+      if (ignore(e)) return;
+      if (e.code === "KeyZ" || e.code === "KeyX") {
+        octave = Math.min(PIANO_HIGH - 12, Math.max(PIANO_LOW, octave + (e.code === "KeyZ" ? -12 : 12)));
+      } else if (e.code in KEYMAP) {
+        if (!e.repeat) press(e.code, octave + KEYMAP[e.code]);
+      } else return;
+      // Keep Spotify's own shortcuts from seeing piano keys
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onKeyUp = (e) => {
+      if (!(e.code in KEYMAP)) return;
+      release(e.code);
+      e.stopPropagation();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("blur", releaseAll);
+
+    let seg = 0;
+    const segmentAt = (starts, t) => {
+      if (seg >= starts.length || starts[seg] > t) seg = 0; // seeked backwards
+      while (seg + 1 < starts.length && starts[seg + 1] <= t) seg++;
+      return seg;
+    };
+
+    let raf = 0;
+    let sig = "";
+    const frame = () => {
+      raf = requestAnimationFrame(frame);
+      const { spans = [], regions = [], mainKey = [null, false] } = view;
+      const t = currentTrackId() === view.id ? (Spicetify.Player.getProgress?.() ?? 0) / 1000 : -1;
+      const span = t >= 0 ? spans.find(([s, e]) => t >= s && t < e) : null;
+      const region = t >= 0 && regions.length ? keyAt(regions, t) : null;
+      const [tonic, minorKey] = region ? [region[2], region[3]] : mainKey;
+      const pitches = pitchCache.get(view.id);
+      const si = pitches && t >= 0 ? segmentAt(pitches.starts, t) : -1;
+      const ac = audioCtx?.currentTime ?? 0;
+      const synth = sounding.filter((n) => n.from <= ac && n.to > ac).map((n) => n.midi);
+      const user = [...held.values()].map((h) => h.midi);
+      const chord = span?.[2] ?? -1;
+      const next = [si, chord, tonic, minorKey, synth, user, octave, keysEl.hidden].join("|");
+      if (next === sig) return;
+      sig = next;
+
+      const tones = chord >= 0 ? voicing(chord) : [];
+      const scale = tonic == null || tonic < 0 ? [] : SCALES[minorKey ? "minor" : "major"];
+      for (const [m, k] of keys) {
+        const pc = m % 12;
+        const energy = si >= 0 ? pitches.pitches[si * 12 + pc] / 255 : 0;
+        k.el.style.setProperty("--energy", (energy * energy).toFixed(2));
+        const on = String(user.includes(m) || synth.includes(m));
+        if (k.el.dataset.held !== on) k.el.dataset.held = on;
+        const role = tones.includes(m) ? (pc === CHORDS[chord].root ? "root" : "tone") : "";
+        if (k.el.dataset.chord !== role) k.el.dataset.chord = role;
+        const d = scale.indexOf((pc - tonic + 12) % 12);
+        const degree = d < 0 ? "" : String(d + 1);
+        if (k.degree.textContent !== degree) k.degree.textContent = degree;
+        k.el.dataset.tonic = String(d === 0);
+        const code = Object.keys(KEYMAP).find((c) => octave + KEYMAP[c] === m);
+        const cap = code ? keyCap(code) : "";
+        if (k.cap.textContent !== cap) k.cap.textContent = cap;
+      }
+
+      const keyName = spellKey(tonic, minorKey);
+      now.textContent =
+        chord >= 0
+          ? `Now ${spellChord(chord, tonic, minorKey)}  ${roman(chord, tonic, minorKey)} in ${keyName}`
+          : t >= 0
+            ? `Now —  in ${keyName}`
+            : `Key ${keyName} · play the track to follow along`;
+      const notes = [...new Set([...user, ...synth])].sort((a, b) => a - b);
+      if (notes.length) {
+        const found = identifyChord(notes);
+        const fn = found && found.chord >= 0 ? functionOf(found.chord, tonic, minorKey) : null;
+        you.textContent = `${notes.map((m) => noteName(m, tonic, minorKey)).join(" ")}${
+          found ? `  =  ${chordLabel(found, tonic, minorKey)}  (${romanOf(found, tonic, minorKey)}${fn ? `, ${FUNCTION_NAMES[fn]}` : ""})` : ""
+        }`;
+      } else {
+        you.textContent = `Play: A–' keys (W E T Y U O P = black), Z / X octave (A = C${octave / 12 - 1}), or click`;
+      }
+    };
+    frame();
+
+    return {
+      el,
+      destroy() {
+        cancelAnimationFrame(raf);
+        releaseAll();
+        window.removeEventListener("keydown", onKeyDown, true);
+        window.removeEventListener("keyup", onKeyUp, true);
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("blur", releaseAll);
+      },
+    };
   }
 
   const CADENCE_NAMES = {
@@ -855,8 +1217,19 @@
     const redraw = () => drawHarmony(view);
 
     const feat = cache.get(id);
-    const { tonic, minor } = res;
     const spans = applyCorrections(res.spans, corrections[id]);
+    const regions = keyRegions(res, spans);
+    // Main key = the region key covering the most time; it can differ from the hint when the chords disagree
+    const keyTime = new Map();
+    for (const [s, e, t, m] of regions) keyTime.set(t * 2 + (m ? 1 : 0), (keyTime.get(t * 2 + (m ? 1 : 0)) ?? 0) + e - s);
+    const main = [...keyTime].sort((a, b) => b[1] - a[1])[0]?.[0];
+    const tonic = main == null ? res.tonic : main >> 1;
+    const minor = main == null ? res.minor : (main & 1) === 1;
+    const keyOf = (t) => {
+      const r = regions.length ? keyAt(regions, t) : null;
+      return r ? [r[2], r[3]] : [tonic, minor];
+    };
+    Object.assign(view, { spans, regions, mainKey: [tonic, minor] });
     const rn = (c) => roman(c, tonic, minor);
     const nm = (c) => spellChord(c, tonic, minor);
     const tool = (text, title, onclick) => {
@@ -869,7 +1242,10 @@
     // Header
     body.appendChild(make("h1", null, meta?.name ?? "Harmony analysis"));
     if (meta?.artist) body.appendChild(make("p", "bpmkey-note", meta.artist));
-    const facts = [`Key ${spellKey(tonic, minor)} (via ${res.keySrc})`];
+    const hinted = tonic === res.tonic && minor === res.minor;
+    const facts = [
+      `Key ${spellKey(tonic, minor)} (${hinted ? `via ${res.keySrc}` : `from the chords; ${res.keySrc} says ${spellKey(res.tonic, res.minor)}`})`,
+    ];
     if (feat?.t) facts.push(`${Math.round(feat.t)} BPM`);
     if (feat?.c) facts.push(feat.c);
     body.appendChild(make("p", null, facts.join(" · ")));
@@ -880,9 +1256,23 @@
         "p",
         "bpmkey-note",
         "Estimated from Spotify audio analysis (major/minor triads only, ~70% of the time right on reference songs). " +
-          "Roman numerals and functions assume the key above; fix wrong chords with ✎ Edit."
+          "Key changes are detected from the chords; the timeline's Roman numerals follow the local key. Fix wrong chords with ✎ Edit."
       )
     );
+
+    // Key regions
+    if (regions.length > 1) {
+      body.appendChild(make("h2", null, "Key changes"));
+      const list = make("div", "bpmkey-chips");
+      regions.forEach(([rs, re, t, m], i) => {
+        if (i) list.appendChild(make("span", "bpmkey-note", "→"));
+        const b = make("button", "bpmkey-cadence", `${fmtTime(rs)}  ${spellKey(t, m)}`);
+        b.title = `${spellKey(t, m)} ${m ? "minor" : "major"} ${fmtTime(rs)}–${fmtTime(re)} · click to play`;
+        b.onclick = () => ((ui.sel = [rs, re]), playSpan(id, rs, re), markSelection());
+        list.appendChild(b);
+      });
+      body.appendChild(list);
+    }
 
     // Progressions
     const progs = topProgressions(spans);
@@ -900,17 +1290,23 @@
     }
 
     // Cadences
-    const cadences = findCadences(spans, tonic, minor, res.sections);
+    // Per key region, so a modulation's own V → I counts in the new key
+    const inRegion = (rs, re) => spans.filter(([s, e]) => (s + e) / 2 >= rs && (s + e) / 2 < re);
+    const cadences = (regions.length ? regions : [[0, Infinity, tonic, minor]]).flatMap(([rs, re, t, m]) =>
+      findCadences(inRegion(rs, re), t, m, res.sections).map((c) => ({ ...c, key: [t, m] }))
+    );
     if (cadences.length) {
       body.appendChild(make("h2", null, "Cadences"));
       const counts = {};
       for (const c of cadences) counts[c.type] = (counts[c.type] ?? 0) + 1;
       body.appendChild(make("p", "bpmkey-note", Object.entries(counts).map(([t, n]) => `${t} ×${n}`).join(" · ")));
       const list = make("div", "bpmkey-chips");
-      for (const { start, end, from, to, type } of cadences.slice(0, 24)) {
-        const b = make("button", "bpmkey-cadence", `${fmtTime(start)}  ${rn(from)}${to >= 0 ? ` → ${rn(to)}` : ""}`);
+      for (const { start, end, from, to, type, key } of cadences.slice(0, 24)) {
+        const r = (c) => roman(c, ...key);
+        const n = (c) => spellChord(c, ...key);
+        const b = make("button", "bpmkey-cadence", `${fmtTime(start)}  ${r(from)}${to >= 0 ? ` → ${r(to)}` : ""}`);
         b.dataset.type = type;
-        b.title = `${CADENCE_NAMES[type]} · ${nm(from)}${to >= 0 ? ` → ${nm(to)}` : ""} · click to play`;
+        b.title = `${CADENCE_NAMES[type]} in ${spellKey(...key)} · ${n(from)}${to >= 0 ? ` → ${n(to)}` : ""} · click to play`;
         b.onclick = () => ((ui.sel = [start, end]), playSpan(id, start, end), markSelection());
         list.appendChild(b);
       }
@@ -920,15 +1316,22 @@
     // Chord usage
     body.appendChild(make("h2", null, "Chord usage"));
     for (const { chord, share } of chordUsage(spans).slice(0, 8)) {
+      // Named in the key where the chord first appears (C♯m in an A major bridge, not D♭m in C)
+      const key = keyOf(spans.find(([, , c]) => c === chord)[0]);
+      const nm = (c) => spellChord(c, ...key);
+      const rn = (c) => roman(c, ...key);
       const pct = `${Math.round(share * 100)}%`;
       const track = make("div", "bpmkey-usage-track");
       track.appendChild(make("div", "bpmkey-usage-bar")).style.width = pct;
       const name = make("button", "bpmkey-synth", `♪ ${nm(chord)}`);
       name.title = "Play this chord (synthesized)";
       name.onclick = () => (stopSynth(), synthChord(chord));
-      const fn = functionOf(chord, tonic, minor);
+      const fn = functionOf(chord, ...key);
+      const inOtherKey = key[0] !== tonic || key[1] !== minor;
       const row = make("div", "bpmkey-usage-row");
-      row.append(name, make("small", null, `${rn(chord)}${fn ? ` ${fn}` : ""}`), track, make("small", null, pct));
+      const label = make("small", null, `${rn(chord)}${fn ? ` ${fn}` : ""}`);
+      if (inOtherKey) label.title = `in ${spellKey(...key)}`;
+      row.append(name, label, track, make("small", null, pct));
       body.appendChild(row);
     }
 
@@ -981,14 +1384,23 @@
     const merged = mergeSpans(spans);
     const nextChord = (s) => merged.find(([ms, , c]) => ms > s && c >= 0)?.[2] ?? -1;
     const chips = [];
-    const sections = res.sections.length ? res.sections : [[0, tonic, minor, 0]];
-    sections.forEach(([start, pc, secMinor, conf], si) => {
+    const sections = res.sections.length ? res.sections : [[0]];
+    let prevKey = null;
+    sections.forEach(([start], si) => {
       const end = sections[si + 1]?.[0] ?? Infinity;
-      const head = make("div", "bpmkey-section", `${fmtTime(start)}  ·  section key ${spellKey(pc, secMinor)}`);
-      if (conf < 0.3) head.dataset.state = "low";
+      const head = make("div", "bpmkey-section", `${fmtTime(start)}  ·  ${spellKey(...keyOf(start))}`);
       const row = make("div", "bpmkey-chips");
       for (const [s, e, c, cf, corrected] of spans.filter(([s]) => s >= start && s < end)) {
-        const info = explainChord(c, nextChord(s), tonic, minor);
+        const key = keyOf(s);
+        if (prevKey && key.join() !== prevKey.join()) {
+          const mod = make("div", "bpmkey-modulation", `→ ${spellKey(...key)}`);
+          mod.title = `key change: ${spellKey(...prevKey)} → ${spellKey(...key)}`;
+          row.appendChild(mod);
+        }
+        prevKey = key;
+        const rn = (x) => roman(x, ...key);
+        const nm = (x) => spellChord(x, ...key);
+        const info = explainChord(c, nextChord(s), ...key);
         const chip = make("div", "bpmkey-chip");
         if (info) chip.dataset.kind = info.kind;
         if (corrected) chip.dataset.corrected = "true";
@@ -1201,7 +1613,7 @@
       position: fixed; inset: 0; z-index: 1000; overflow-y: auto; padding: 48px 32px;
       background: var(--spice-main, #121212); color: var(--spice-text, #fff);
     }
-    .bpmkey-page-body { max-width: 960px; margin: 0 auto; }
+    .bpmkey-page-body { max-width: 960px; margin: 0 auto; padding-bottom: 200px; }
     .bpmkey-page-close {
       position: fixed; top: 16px; right: 24px; width: 32px; height: 32px; border: 0; border-radius: 50%;
       background: var(--spice-card, #282828); color: var(--spice-text, #fff); cursor: pointer;
@@ -1248,6 +1660,40 @@
     .bpmkey-cadence[data-type="authentic"] { border-color: #1db954; }
     .bpmkey-cadence[data-type="plagal"] { border-color: #4f9dff; }
     .bpmkey-cadence[data-type="deceptive"] { border-color: #ff9f43; }
+    .bpmkey-modulation { align-self: center; padding: 0 6px; color: #c58bff; font-size: 12px; font-weight: 700; }
+    .bpmkey-piano {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 1001; padding: 8px 32px 12px;
+      background: var(--spice-main, #121212); border-top: 1px solid rgba(255, 255, 255, .1); box-shadow: 0 -8px 24px rgba(0, 0, 0, .5);
+    }
+    .bpmkey-piano-head {
+      display: flex; align-items: center; gap: 16px; max-width: 960px; margin: 0 auto 6px;
+      font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap;
+    }
+    .bpmkey-piano-now { font-weight: 700; }
+    .bpmkey-piano-you { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--spice-subtext, #b3b3b3); }
+    .bpmkey-piano-keys { position: relative; max-width: 960px; height: 110px; margin: 0 auto; user-select: none; touch-action: none; }
+    .bpmkey-key {
+      position: absolute; top: 0; height: 100%; box-sizing: border-box; display: flex; flex-direction: column;
+      justify-content: flex-end; align-items: center; padding-bottom: 3px; border: 1px solid #222; border-radius: 0 0 4px 4px;
+      background: #e8e8e8; color: #333; cursor: pointer;
+    }
+    .bpmkey-key-black { z-index: 1; height: 62%; background: #181818; color: #bbb; border-color: #000; }
+    /* live pitch-class energy of the current segment */
+    .bpmkey-key::before {
+      content: ""; position: absolute; top: 3px; left: 2px; right: 2px; height: 18%; border-radius: 2px;
+      background: #1db954; opacity: var(--energy, 0);
+    }
+    .bpmkey-key[data-chord="tone"] { background: #a7dcb7; }
+    .bpmkey-key[data-chord="root"] { background: #57c27a; }
+    .bpmkey-key-black[data-chord="tone"] { background: #2f7a49; }
+    .bpmkey-key-black[data-chord="root"] { background: #1db954; }
+    .bpmkey-key[data-held="true"] { background: #ffcc4d; }
+    .bpmkey-key-black[data-held="true"] { background: #d9a400; }
+    .bpmkey-key small { font-size: 9px; line-height: 1.25; pointer-events: none; }
+    .bpmkey-key-cap { opacity: .55; }
+    .bpmkey-key[data-tonic="true"] .bpmkey-key-degree { color: #0b7a34; font-weight: 700; }
+    .bpmkey-key-black[data-tonic="true"] .bpmkey-key-degree { color: #7dffa8; }
+    .bpmkey-key-octave { opacity: .5; }
     .bpmkey-edit { background: var(--spice-main, #121212); color: var(--spice-text, #fff); border: 0; font: inherit; font-size: 12px; }
   `;
   document.head.appendChild(style);
@@ -1277,6 +1723,11 @@
     explainChord,
     findCadences,
     flavorHints,
+    localKeys,
+    keyRegions,
+    identifyChord,
+    chordLabel,
+    romanOf,
     applyCorrections,
     toLab,
     get corrections() {

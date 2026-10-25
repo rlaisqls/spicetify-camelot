@@ -115,3 +115,27 @@ test("corrections override spans by time and export as .lab", () => {
   assert.equal(k.toLab(fixed), "0.000 2.000 C\n2.000 4.000 A:min\n4.000 6.000 G");
   assert.equal(k.toLab([[0, 1, -1], [1, 3, maj(1)], [3, 4, -2]]), "0.000 1.000 N\n1.000 3.000 C#\n3.000 4.000 X");
 });
+
+test("local keys follow a modulation and ignore short excursions", () => {
+  // C major verse, A major bridge (like Something), back to C; a lone D (V/V) stays in C
+  const bar = (chords, t0) => chords.map((c, i) => [t0 + i * 2, t0 + i * 2 + 2, c]);
+  const verse = (t0) => bar([maj(C), maj(C), min(A), maj(F), maj(D), maj(G), maj(C), maj(G)], t0);
+  const bridge = bar([maj(A), min(1), min(6), maj(A), maj(D), maj(E), maj(A), maj(E), maj(A), min(1), maj(D), maj(E)], 32);
+  const spans = [...verse(0), ...verse(16), ...bridge, ...verse(56), ...verse(72)];
+  const keys = plain(k.localKeys(spans, C, false).map(([s, e, t, m]) => [s, t, m]));
+  assert.deepEqual(keys, [[0, C, false], [32, A, false], [56, C, false]]);
+});
+
+test("names played notes as chords in the key", () => {
+  const name = (midis, tonic = C, minor = false) => {
+    const c = k.identifyChord(midis);
+    return c && `${k.chordLabel(c, tonic, minor)} ${k.romanOf(c, tonic, minor)}`;
+  };
+  assert.equal(name([60, 64, 67]), "C I");
+  assert.equal(name([57, 60, 64]), "Am vi");
+  assert.equal(name([64, 67, 72]), "C/E I"); // first inversion keeps the root
+  assert.equal(name([55, 59, 62, 65]), "G7 V7");
+  assert.equal(name([59, 62, 65]), "Bdim vii°");
+  assert.equal(name([58, 62, 65], F, false), "B♭ IV");
+  assert.equal(name([60, 61]), null);
+});
