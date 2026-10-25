@@ -8,6 +8,12 @@ Billie Jean  Michael Jackson   117 · F♯m · 11A  4:54
 
 Spotify's own BPM/Key columns only appear in Mix-enabled playlists. This extension puts the same data everywhere.
 
+<img width="600" src="https://github.com/user-attachments/assets/77a039da-40eb-422f-bd5b-07d9741b750f" />
+
+<img width="600" src="https://github.com/user-attachments/assets/d6e9056e-84ae-4b7c-bf11-81436ee86eac" />
+
+
+
 ## Install
 
 ```sh
