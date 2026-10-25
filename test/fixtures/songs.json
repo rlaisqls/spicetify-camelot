@@ -1,0 +1,23 @@
+[
+  { "slug": "let-it-be", "split": "tune", "title": "Let It Be", "query": "Let It Be Remastered 2009 The Beatles Let It Be" },
+  { "slug": "here-comes-the-sun", "split": "tune", "title": "Here Comes The Sun", "query": "Here Comes The Sun Remastered 2009 The Beatles" },
+  { "slug": "something", "split": "tune", "title": "Something", "query": "Something Remastered 2009 The Beatles Abbey Road" },
+  { "slug": "yesterday", "split": "tune", "title": "Yesterday", "query": "Yesterday Remastered 2009 The Beatles Help!" },
+  { "slug": "help", "split": "tune", "title": "Help!", "query": "Help! Remastered 2009 The Beatles" },
+  { "slug": "ticket-to-ride", "split": "tune", "title": "Ticket To Ride", "query": "Ticket To Ride Remastered 2009 The Beatles" },
+  { "slug": "eleanor-rigby", "split": "tune", "title": "Eleanor Rigby", "query": "Eleanor Rigby Remastered 2009 The Beatles Revolver" },
+  { "slug": "ob-la-di-ob-la-da", "split": "tune", "title": "Ob-La-Di, Ob-La-Da", "query": "Ob-La-Di, Ob-La-Da Remastered 2009 The Beatles" },
+  { "slug": "get-back", "split": "tune", "title": "Get Back", "query": "Get Back Remastered 2009 The Beatles Let It Be" },
+  { "slug": "across-the-universe", "split": "tune", "title": "Across The Universe", "query": "Across The Universe Remastered 2009 The Beatles Let It Be" },
+
+  { "slug": "come-together", "split": "holdout", "title": "Come Together", "query": "Come Together Remastered 2009 The Beatles Abbey Road" },
+  { "slug": "octopuss-garden", "split": "holdout", "title": "Octopus's Garden", "query": "Octopus's Garden Remastered 2009 The Beatles" },
+  { "slug": "while-my-guitar-gently-weeps", "split": "holdout", "title": "While My Guitar Gently Weeps", "query": "While My Guitar Gently Weeps Remastered 2009 The Beatles" },
+  { "slug": "norwegian-wood", "split": "holdout", "title": "Norwegian Wood (This Bird Has Flown)", "query": "Norwegian Wood Remastered 2009 The Beatles Rubber Soul" },
+  { "slug": "michelle", "split": "holdout", "title": "Michelle", "query": "Michelle Remastered 2009 The Beatles Rubber Soul" },
+  { "slug": "in-my-life", "split": "holdout", "title": "In My Life", "query": "In My Life Remastered 2009 The Beatles Rubber Soul" },
+  { "slug": "penny-lane", "split": "holdout", "title": "Penny Lane", "query": "Penny Lane Remastered 2009 The Beatles Magical Mystery Tour" },
+  { "slug": "lucy-in-the-sky-with-diamonds", "split": "holdout", "title": "Lucy In The Sky With Diamonds", "query": "Lucy In The Sky With Diamonds Remastered 2009 The Beatles" },
+  { "slug": "cant-buy-me-love", "split": "holdout", "title": "Can't Buy Me Love", "query": "Can't Buy Me Love Remastered 2009 The Beatles A Hard Day's Night" },
+  { "slug": "taxman", "split": "holdout", "title": "Taxman", "query": "Taxman Remastered 2009 The Beatles Revolver" }
+]

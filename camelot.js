@@ -18,6 +18,24 @@
   // Camelot wheel number by pitch class (B for major, A for minor)
   const CAMELOT_MAJOR = [8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1];
   const CAMELOT_MINOR = [5, 12, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10];
+  const CHORD_CACHE_KEY = "bpm-key:chords:v2"; // bump when the estimator changes
+  const CHORD_CACHE_LIMIT = 100;
+  // Chord estimator tuning, chosen on the plateau (not the peak) of `node test/eval.mjs` sweeps.
+  // Baseline before tuning: majmin 65.9%; with these values: 76.6% (Spotify key hint).
+  const PARAMS = {
+    keyPrior: 0.05, // bonus for chords diatonic to the track key
+    switchPenalty: 0.1, // Viterbi cost of changing chords between windows
+    silenceAmp: 0.01, // ≈ -40 dB; quieter windows get no chord
+    windowsPerBar: 2, // analysis windows per bar
+    flatPower: 2, // weight segments by (1 - mean chroma)^flatPower; flat chroma ≈ drums/noise
+    thirdWeight: 0.7, // template weight of the third (root = 1)
+    fifthWeight: 0.8, // template weight of the fifth
+    repContext: 4, // repetition smoothing: windows on each side compared between candidates
+    repTopK: 8, // number of most similar repetitions averaged in (0 = off)
+    repThreshold: 0.5, // minimum context similarity for a repetition
+    repWeight: 2, // weight of the averaged repetitions relative to the window itself
+  };
+  const LOW_CONFIDENCE = 0.4;
 
   // ---- data sources ----
 
@@ -240,6 +258,820 @@
     }
   }
 
+  // ---- chords ----
+
+  // Chord index = root * 2 + (minor ? 1 : 0); -1 means no chord
+  const CHORDS = Array.from({ length: 24 }, (_, i) => {
+    const root = i >> 1;
+    const minor = (i & 1) === 1;
+    return { root, minor, tones: [0, minor ? 3 : 4, 7].map((d) => (root + d) % 12) };
+  });
+  const chordName = (i) => (i < 0 ? "N" : `${PITCHES[CHORDS[i].root]}${CHORDS[i].minor ? "m" : ""}`);
+
+  // Key-aware spelling: flat keys and ♭-degree chords use flats (E♭ as ♭III in C, not D♯)
+  const FLAT_PITCHES = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"];
+  const FLAT_MAJOR_TONICS = new Set([1, 3, 5, 8, 10]); // D♭ E♭ F A♭ B♭
+  const FLAT_MINOR_TONICS = new Set([0, 2, 3, 5, 7, 10]); // Cm Dm E♭m Fm Gm B♭m
+  const usesFlats = (tonic, minorKey) => (minorKey ? FLAT_MINOR_TONICS : FLAT_MAJOR_TONICS).has(tonic);
+  function spellChord(chord, tonic, minorKey) {
+    if (chord < 0 || tonic == null || tonic < 0) return chordName(chord);
+    const { root, minor } = CHORDS[chord];
+    const flat = usesFlats(tonic, minorKey) || roman(chord, tonic, minorKey).startsWith("♭");
+    return `${(flat ? FLAT_PITCHES : PITCHES)[root]}${minor ? "m" : ""}`;
+  }
+  const spellKey = (tonic, minorKey) =>
+    tonic == null || tonic < 0 ? "?" : `${(usesFlats(tonic, minorKey) ? FLAT_PITCHES : PITCHES)[tonic]}${minorKey ? "m" : ""}`;
+
+  const centered = (v) => {
+    const mean = v.reduce((a, b) => a + b, 0) / v.length;
+    const c = v.map((x) => x - mean);
+    const norm = Math.hypot(...c) || 1;
+    return c.map((x) => x / norm);
+  };
+  // Mean-centered templates so the score is a Pearson correlation with the chroma
+  const makeTemplates = () =>
+    CHORDS.map(({ tones: [root, third, fifth] }) => {
+      const v = new Array(12).fill(0);
+      v[root] = 1;
+      v[third] = PARAMS.thirdWeight;
+      v[fifth] = PARAMS.fifthWeight;
+      return centered(v);
+    });
+  const ZERO_EMISSION = new Array(24).fill(0);
+
+  const pitchClassOf = (name) => {
+    const m = name?.match(/^([A-G])([♯#♭b])?/);
+    if (!m) return null;
+    const base = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]];
+    const shift = m[2] === "♯" || m[2] === "#" ? 1 : m[2] ? 11 : 0;
+    return (base + shift) % 12;
+  };
+
+  const MAJOR_DIATONIC = [[0, false], [2, true], [4, true], [5, false], [7, false], [9, true]];
+  const MINOR_DIATONIC = [[0, true], [3, false], [5, true], [7, true], [7, false], [8, false], [10, false]];
+  const diatonicSet = (tonic, minor) =>
+    tonic == null || tonic < 0
+      ? new Set()
+      : new Set((minor ? MINOR_DIATONIC : MAJOR_DIATONIC).map(([d, m]) => ((tonic + d) % 12) * 2 + (m ? 1 : 0)));
+
+  const ROMAN_MAJOR = ["I", "♭II", "II", "♭III", "III", "IV", "♯IV", "V", "♭VI", "VI", "♭VII", "VII"];
+  const ROMAN_MINOR = ["I", "♭II", "II", "III", "♯III", "IV", "♯IV", "V", "VI", "♯VI", "VII", "♯VII"];
+  function roman(chord, tonic, minorKey) {
+    if (chord < 0 || tonic == null || tonic < 0) return "";
+    const { root, minor } = CHORDS[chord];
+    const r = (minorKey ? ROMAN_MINOR : ROMAN_MAJOR)[(root - tonic + 12) % 12];
+    return minor ? r.toLowerCase() : r;
+  }
+
+  // Loudness-weighted average chroma per time window; null when the window is near silent
+  function windowChroma(segments, windows) {
+    let j = 0;
+    return windows.map(([from, to]) => {
+      while (j < segments.length && segments[j].start + segments[j].duration <= from) j++;
+      const acc = new Array(12).fill(0);
+      let weight = 0;
+      for (let k = j; k < segments.length && segments[k].start < to; k++) {
+        const s = segments[k];
+        const overlap = Math.min(to, s.start + s.duration) - Math.max(from, s.start);
+        if (overlap <= 0 || !Array.isArray(s.pitches)) continue;
+        // Drum hits and noise light up every pitch class; tonal segments have a few peaks
+        const flatness = s.pitches.reduce((a, b) => a + b, 0) / 12;
+        const w = overlap * 10 ** ((s.loudness_max ?? -60) / 20) * (1 - flatness) ** PARAMS.flatPower;
+        s.pitches.forEach((p, i) => (acc[i] += p * w));
+        weight += w;
+      }
+      return weight / (to - from) < PARAMS.silenceAmp ? null : centered(acc);
+    });
+  }
+
+  // Songs repeat: average each window with the windows whose surrounding context looks most alike
+  // (same place in another chorus/verse). Averaging repetitions cancels noise that differs between them.
+  function smoothRepetitions(chromas) {
+    const { repContext: h, repTopK: k, repThreshold, repWeight } = PARAMS;
+    const n = chromas.length;
+    if (!k || n < 2 * h + 2) return chromas;
+    const dot = Array.from({ length: n }, () => new Float32Array(n));
+    for (let i = 0; i < n; i++) {
+      for (let j = i; j < n; j++) {
+        const a = chromas[i];
+        const b = chromas[j];
+        const v = a && b ? a.reduce((sum, x, d) => sum + x * b[d], 0) : 0;
+        dot[i][j] = dot[j][i] = v;
+      }
+    }
+    return chromas.map((c, i) => {
+      if (!c) return c;
+      const matches = [];
+      for (let j = 0; j < n; j++) {
+        if (Math.abs(i - j) <= h || !chromas[j]) continue;
+        let sum = 0;
+        let count = 0;
+        for (let d = -h; d <= h; d++) {
+          if (i + d < 0 || j + d < 0 || i + d >= n || j + d >= n) continue;
+          sum += dot[i + d][j + d];
+          count++;
+        }
+        const sim = count ? sum / count : 0;
+        if (sim >= repThreshold) matches.push([sim, j]);
+      }
+      if (!matches.length) return c;
+      matches.sort((a, b) => b[0] - a[0]);
+      const top = matches.slice(0, k);
+      const acc = c.slice();
+      for (const [sim, j] of top) chromas[j].forEach((x, d) => (acc[d] += (repWeight * sim * x) / top.length));
+      return centered(acc);
+    });
+  }
+
+  // Emissions are per-state scores; staying on a chord is free, switching costs PARAMS.switchPenalty
+  function viterbi(emissions) {
+    if (!emissions.length) return [];
+    let score = Float64Array.from(emissions[0]);
+    const back = [];
+    for (let t = 1; t < emissions.length; t++) {
+      let best = 0;
+      for (let s = 1; s < 24; s++) if (score[s] > score[best]) best = s;
+      const switched = score[best] - PARAMS.switchPenalty;
+      const next = new Float64Array(24);
+      const from = new Int8Array(24);
+      for (let s = 0; s < 24; s++) {
+        const stay = score[s] >= switched;
+        next[s] = (stay ? score[s] : switched) + emissions[t][s];
+        from[s] = stay ? s : best;
+      }
+      back.push(from);
+      score = next;
+    }
+    let s = 0;
+    for (let i = 1; i < 24; i++) if (score[i] > score[s]) s = i;
+    const path = new Array(emissions.length);
+    path[path.length - 1] = s;
+    for (let t = back.length; t > 0; t--) path[t - 1] = s = back[t - 1][s];
+    return path;
+  }
+
+  const round2 = (x) => Math.round(x * 100) / 100;
+
+  // Result: { tonic, minor, keySrc, spans: [[start, end, chord, conf]], sections: [[start, pc, minor, conf]] }
+  function analyzeChords(data, keyHint) {
+    const bars = data?.bars;
+    const segments = data?.segments;
+    if (!bars?.length || !segments?.length) return null;
+    const per = PARAMS.windowsPerBar;
+    const windows = bars.flatMap(({ start, duration }) =>
+      Array.from({ length: per }, (_, i) => [start + (duration * i) / per, start + (duration * (i + 1)) / per])
+    );
+    const tonic = keyHint?.tonic ?? (data.track?.key >= 0 ? data.track.key : null);
+    const minor = keyHint ? keyHint.minor : data.track?.mode === 0;
+    const diatonic = diatonicSet(tonic, minor);
+    const templates = makeTemplates();
+    const corr = smoothRepetitions(windowChroma(segments, windows)).map((c) =>
+      c ? templates.map((t) => t.reduce((sum, x, i) => sum + x * c[i], 0)) : null
+    );
+    const path = viterbi(corr.map((r) => (r ? r.map((v, s) => v + (diatonic.has(s) ? PARAMS.keyPrior : 0)) : ZERO_EMISSION)));
+
+    // Merge consecutive windows with the same chord: [start, end, chord, confSum, count]
+    const spans = [];
+    windows.forEach(([from, to], t) => {
+      const chord = corr[t] ? path[t] : -1;
+      const conf = corr[t] ? corr[t][chord] : 0;
+      const last = spans[spans.length - 1];
+      if (last && last[2] === chord && from - last[1] < 0.05) {
+        last[1] = to;
+        last[3] += conf;
+        last[4]++;
+      } else spans.push([from, to, chord, conf, 1]);
+    });
+
+    return {
+      tonic,
+      minor,
+      keySrc: keyHint ? keyHint.src : "audio-analysis",
+      spans: spans.map(([a, b, c, sum, n]) => [round2(a), round2(b), c, round2(sum / n)]),
+      sections: (data.sections ?? []).map((s) => [round2(s.start), s.key, s.mode === 0, round2(s.key_confidence ?? 0)]),
+    };
+  }
+
+  // Most frequent 4-chord loops (ignoring no-chord spans), e.g. "F♯m → G♯m → A → G♯m"
+  function topProgressions(spans, limit = 3) {
+    const seq = spans.map((s) => s[2]).filter((c) => c >= 0);
+    const counts = new Map();
+    for (let i = 0; i + 4 <= seq.length; i++) {
+      const gram = seq.slice(i, i + 4);
+      if (new Set(gram).size < 2) continue;
+      const k = gram.join(",");
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    return [...counts]
+      .filter(([, n]) => n >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([k, n]) => ({ chords: k.split(",").map(Number), count: n }));
+  }
+
+  // Share of total (non-silent) time per chord, most used first
+  function chordUsage(spans) {
+    const time = new Map();
+    let sum = 0;
+    for (const [s, e, c] of spans) {
+      if (c < 0) continue;
+      time.set(c, (time.get(c) ?? 0) + e - s);
+      sum += e - s;
+    }
+    return [...time].sort((a, b) => b[1] - a[1]).map(([chord, t]) => ({ chord, share: t / sum }));
+  }
+
+  // Joins adjacent spans with the same chord: [start, end, chord]
+  function mergeSpans(spans) {
+    const out = [];
+    for (const [s, e, c] of spans) {
+      const last = out[out.length - 1];
+      if (last && last[2] === c && s - last[1] < 0.05) last[1] = e;
+      else out.push([s, e, c]);
+    }
+    return out;
+  }
+
+  // ---- harmony theory ----
+
+  const degreeOf = (chord, tonic) => (CHORDS[chord].root - tonic + 12) % 12;
+  const chordKey = (chord, tonic) => `${degreeOf(chord, tonic)},${CHORDS[chord].minor ? 1 : 0}`;
+
+  // Function of diatonic triads, keyed by "degree,minor": T(onic) / S(ubdominant) / D(ominant)
+  const FUNCTIONS_MAJOR = { "0,0": "T", "4,1": "T", "9,1": "T", "2,1": "S", "5,0": "S", "7,0": "D" };
+  const FUNCTIONS_MINOR = { "0,1": "T", "3,0": "T", "5,1": "S", "8,0": "S", "7,0": "D", "7,1": "D", "10,0": "D" };
+  const FUNCTION_NAMES = { T: "tonic", S: "subdominant", D: "dominant" };
+  function functionOf(chord, tonic, minorKey) {
+    if (chord < 0 || tonic == null || tonic < 0) return null;
+    return (minorKey ? FUNCTIONS_MINOR : FUNCTIONS_MAJOR)[chordKey(chord, tonic)] ?? null;
+  }
+
+  // Common non-diatonic chords borrowed from a related mode, keyed by "degree,minor"
+  const BORROWED_MAJOR = {
+    "5,1": "iv from the parallel minor",
+    "8,0": "♭VI from the parallel minor",
+    "10,0": "♭VII from the parallel minor / Mixolydian",
+    "3,0": "♭III from the parallel minor",
+    "0,1": "i from the parallel minor",
+    "7,1": "v from the parallel minor / Mixolydian",
+  };
+  const BORROWED_MINOR = {
+    "5,0": "Dorian IV (raised 6th degree)",
+    "2,1": "Dorian ii (raised 6th degree)",
+    "0,0": "I from the parallel major (Picardy third)",
+  };
+
+  // Explains a chord in context: { kind: diatonic|secondary|borrowed|chromatic, fn?, label?, note }
+  function explainChord(chord, next, tonic, minorKey) {
+    if (chord < 0 || tonic == null || tonic < 0) return null;
+    const fn = functionOf(chord, tonic, minorKey);
+    if (fn) return { kind: "diatonic", fn, note: `${FUNCTION_NAMES[fn]} function` };
+
+    // Secondary dominant: a major chord a fifth above a diatonic chord other than the tonic
+    const { root, minor } = CHORDS[chord];
+    const targetRoot = (root + 5) % 12;
+    const target = minor ? null : [...diatonicSet(tonic, minorKey)].find((c) => CHORDS[c].root === targetRoot && targetRoot !== tonic);
+    const resolves = target != null && next >= 0 && CHORDS[next].root === targetRoot;
+    const secondary = target != null && {
+      kind: "secondary",
+      label: `V/${roman(target, tonic, minorKey)}`,
+      note: resolves
+        ? `secondary dominant, resolves to ${chordName(next)}`
+        : `secondary dominant of ${chordName(target)} (doesn't resolve here)`,
+    };
+    if (resolves) return secondary;
+
+    const borrowed = (minorKey ? BORROWED_MINOR : BORROWED_MAJOR)[chordKey(chord, tonic)];
+    if (borrowed) return { kind: "borrowed", note: `borrowed: ${borrowed}` };
+    if (secondary) return secondary;
+    if (!minor && degreeOf(chord, tonic) === 1) return { kind: "chromatic", note: "Neapolitan chord (♭II)" };
+    return { kind: "chromatic", note: "chromatic, outside the key" };
+  }
+
+  // Cadences between consecutive chords; a phrase (section) ending on V counts as a half cadence
+  function findCadences(spans, tonic, minorKey, sections = []) {
+    if (tonic == null || tonic < 0) return [];
+    const seq = mergeSpans(spans).filter(([, , c]) => c >= 0);
+    const deg = (c) => degreeOf(c, tonic);
+    const isV = (c) => deg(c) === 7 && !CHORDS[c].minor;
+    const out = [];
+    for (let i = 0; i + 1 < seq.length; i++) {
+      const [start, , a] = seq[i];
+      const [, end, b] = seq[i + 1];
+      let type = null;
+      if (isV(a) && deg(b) === 0) type = "authentic";
+      else if (deg(a) === 5 && deg(b) === 0) type = "plagal";
+      else if (isV(a) && deg(b) === (minorKey ? 8 : 9)) type = "deceptive";
+      if (type) out.push({ start, end, from: a, to: b, type });
+    }
+    for (const [start, end, c] of seq) {
+      if (isV(c) && sections.some(([t]) => t > 0 && Math.abs(t - end) < 1) && !out.some((o) => o.start === start)) {
+        out.push({ start, end, from: c, to: -1, type: "half" });
+      }
+    }
+    return out.sort((a, b) => a.start - b.start);
+  }
+
+  // Modal color of the whole track from how much time characteristic chords take up
+  function flavorHints(spans, tonic, minorKey) {
+    if (tonic == null || tonic < 0) return [];
+    const usage = chordUsage(spans);
+    const share = (...keys) =>
+      usage.filter(({ chord }) => keys.includes(chordKey(chord, tonic))).reduce((sum, u) => sum + u.share, 0);
+    const MIN = 0.05;
+    const hints = [];
+    if (minorKey) {
+      if (share("5,0", "2,1") >= MIN) hints.push("Dorian color (major IV / minor ii)");
+      if (share("7,0") >= MIN) hints.push("harmonic minor (major V)");
+      else if (share("10,0") >= MIN) hints.push("Aeolian cadences (♭VII instead of V)");
+    } else {
+      if (share("10,0") >= MIN) hints.push("Mixolydian color (♭VII)");
+      if (share("5,1", "8,0", "3,0") >= MIN) hints.push("modal mixture from the parallel minor");
+      if (share("2,0", "4,0", "9,0", "11,0") >= MIN) hints.push("secondary dominants");
+    }
+    return hints;
+  }
+
+  // ---- corrections ----
+
+  // User fixes are stored as time ranges [start, end, chord] so they survive estimator changes
+  const CORRECTIONS_KEY = "bpm-key:corrections:v1";
+  let corrections = {};
+  try {
+    corrections = JSON.parse(localStorage.getItem(CORRECTIONS_KEY) ?? "{}");
+  } catch {}
+  const saveCorrections = () => {
+    try {
+      localStorage.setItem(CORRECTIONS_KEY, JSON.stringify(corrections));
+    } catch {}
+  };
+  function setCorrection(id, start, end, chord) {
+    const list = (corrections[id] ?? []).filter(([s, e]) => e <= start || s >= end);
+    list.push([start, end, chord]);
+    corrections[id] = list.sort((a, b) => a[0] - b[0]);
+    saveCorrections();
+  }
+  function clearCorrections(id) {
+    delete corrections[id];
+    saveCorrections();
+  }
+  // Spans get [start, end, chord, conf, corrected]
+  function applyCorrections(spans, fixes = []) {
+    if (!fixes.length) return spans;
+    return spans.map(([s, e, c, cf]) => {
+      const mid = (s + e) / 2;
+      const fix = fixes.find(([fs, fe]) => mid >= fs && mid < fe);
+      return fix ? [s, e, fix[2], 1, true] : [s, e, c, cf];
+    });
+  }
+
+  // Isophonics/Harte .lab text (the format test/eval.mjs scores against); X marks unannotated gaps
+  const HARTE_ROOTS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
+  const harteLabel = (c) => (c < 0 ? "N" : `${HARTE_ROOTS[CHORDS[c].root]}${CHORDS[c].minor ? ":min" : ""}`);
+  function toLab(spans) {
+    return mergeSpans(spans)
+      .map(([s, e, c]) => `${s.toFixed(3)} ${e.toFixed(3)} ${c === -2 ? "X" : harteLabel(c)}`)
+      .join("\n");
+  }
+
+  const chordCache = new Map(); // id → analyzeChords result | null
+  try {
+    for (const [id, v] of Object.entries(JSON.parse(localStorage.getItem(CHORD_CACHE_KEY) ?? "{}"))) chordCache.set(id, v);
+  } catch {}
+  const persistChords = () => {
+    while (chordCache.size > CHORD_CACHE_LIMIT) chordCache.delete(chordCache.keys().next().value);
+    try {
+      localStorage.setItem(CHORD_CACHE_KEY, JSON.stringify(Object.fromEntries(chordCache)));
+    } catch {}
+  };
+
+  const ANALYSIS_URLS = [
+    (id) => `https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${id}?format=json`,
+    (id) => `https://api.spotify.com/v1/audio-analysis/${id}`,
+  ];
+  async function fetchChords(id) {
+    let data = null;
+    for (const url of ANALYSIS_URLS) {
+      try {
+        data = await getJSON(url(id));
+        if (data?.segments?.length) break;
+      } catch (e) {
+        console.debug(TAG, "analysis", e);
+      }
+    }
+    if (!data?.segments?.length) return null; // not cached, so the next open retries
+    // Prefer the Mix key (more reliable than audio-analysis, see README)
+    const feat = cache.get(id);
+    const pc = pitchClassOf(feat?.n);
+    const keyHint = pc == null ? null : { tonic: pc, minor: !!feat.minor, src: feat.src ?? strategy };
+    const res = analyzeChords(data, keyHint);
+    chordCache.delete(id);
+    chordCache.set(id, res);
+    persistChords();
+    return res;
+  }
+
+  // Analysis is only fetched on demand, when the harmony page is opened
+  const chordPending = new Map(); // id → Promise
+  function loadChords(id) {
+    if (chordCache.has(id)) return Promise.resolve(chordCache.get(id));
+    if (!chordPending.has(id)) chordPending.set(id, fetchChords(id).finally(() => chordPending.delete(id)));
+    return chordPending.get(id);
+  }
+
+  async function trackMeta(id) {
+    const item = Spicetify.Player.data?.item;
+    const fromItem = (t) => ({ name: t.name, artist: t.artists?.map((a) => a.name).join(", ") });
+    if (item?.uri === `spotify:track:${id}`) return fromItem(item);
+    // The client's own GraphQL query; the public Web API is often rate limited (429) inside the client
+    try {
+      const G = Spicetify.GraphQL;
+      const t = (await G.Request(G.Definitions.getTrack, { uri: `spotify:track:${id}` }))?.data?.trackUnion;
+      if (t?.name) {
+        const artists = [t.firstArtist, t.otherArtists].flatMap((a) => a?.items ?? []).map((a) => a.profile?.name);
+        return { name: t.name, artist: artists.filter(Boolean).join(", ") };
+      }
+    } catch {}
+    try {
+      return fromItem(await getJSON(`https://api.spotify.com/v1/tracks/${id}`));
+    } catch {
+      return null;
+    }
+  }
+
+  const keyLabel = (pc, minor) => (pc == null || pc < 0 ? "?" : `${PITCHES[pc]}${minor ? "m" : ""}`);
+
+  function currentTrackId() {
+    const uri = Spicetify.Player.data?.item?.uri ?? Spicetify.Player.data?.track?.uri;
+    return uri && Spicetify.URI.isTrack(uri) ? uri.split(":")[2] : null;
+  }
+
+  // ---- playback ----
+
+  // Synthesized chord: bass root plus a close-position triad, E2–D♯3 / E3–D♯4 so every key sits in the same range
+  let audioCtx = null;
+  let voices = [];
+  function stopSynth() {
+    for (const v of voices) {
+      try {
+        v.stop();
+      } catch {}
+    }
+    voices = [];
+  }
+  function synthChord(chord, when = 0, dur = 1.2) {
+    if (chord < 0) return;
+    audioCtx ??= new AudioContext();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    const t0 = audioCtx.currentTime + when;
+    const { root, minor } = CHORDS[chord];
+    const base = 52 + ((root - 4 + 12) % 12);
+    const midis = [base - 12, base, base + (minor ? 3 : 4), base + 7];
+    midis.forEach((m) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "triangle";
+      osc.frequency.value = 440 * 2 ** ((m - 69) / 12);
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(0.25 / midis.length, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.05);
+      voices.push(osc);
+    });
+  }
+  // One chord per bar at the track tempo (clamped so very slow/fast tracks stay listenable)
+  function synthProgression(chords, bpm) {
+    stopSynth();
+    const bar = Math.min(2.5, Math.max(0.8, 240 / (bpm || 120)));
+    chords.forEach((c, i) => synthChord(c, i * bar, bar * 0.95));
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitFor(cond, ms) {
+    for (const until = Date.now() + ms; Date.now() < until; await sleep(100)) if (cond()) return true;
+    return false;
+  }
+
+  // Plays [start, end) of the track, then pauses or (while loopEnabled) jumps back to start.
+  // Manual seeking elsewhere just cancels the watch.
+  let spanWatch = null;
+  let loopEnabled = false;
+  async function playSpan(id, start, end) {
+    clearInterval(spanWatch);
+    stopSynth();
+    const P = Spicetify.Player;
+    if (currentTrackId() !== id) {
+      await P.playUri?.(`spotify:track:${id}`);
+      if (!(await waitFor(() => currentTrackId() === id && P.isPlaying?.(), 5000))) return;
+    } else if (!P.isPlaying?.()) P.play?.();
+    P.seek?.(Math.max(start * 1000, 1)); // seek() treats values ≤ 1 as a fraction of the track
+    let seen = false;
+    let deadline = Date.now() + (end - start + 5) * 1000;
+    spanWatch = setInterval(() => {
+      const t = (P.getProgress?.() ?? 0) / 1000;
+      const inside = t >= start - 0.5 && t < end;
+      if (!seen) {
+        seen = inside; // ignore stale positions until the seek lands
+        if (!seen && Date.now() < deadline) return;
+      }
+      if (currentTrackId() !== id || Date.now() > deadline || t < start - 1 || t > end + 1) {
+        clearInterval(spanWatch);
+      } else if (t >= end && loopEnabled) {
+        P.seek?.(Math.max(start * 1000, 1));
+        seen = false;
+        deadline = Date.now() + (end - start + 5) * 1000;
+      } else if (t >= end) {
+        P.pause?.();
+        clearInterval(spanWatch);
+      }
+    }, 100);
+  }
+
+  // ---- harmony page ----
+
+  const make = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  };
+
+  let page = null;
+  let pageTimer = null;
+  const onPageKey = (e) => e.key === "Escape" && closeHarmonyPage();
+
+  function closeHarmonyPage() {
+    clearInterval(pageTimer);
+    // Stop looping/auto-pause but let the track keep playing
+    clearInterval(spanWatch);
+    loopEnabled = false;
+    stopSynth();
+    document.removeEventListener("keydown", onPageKey);
+    page?.remove();
+    page = null;
+  }
+
+  async function openHarmonyPage(id) {
+    if (!id) return;
+    closeHarmonyPage();
+    const root = make("div", "bpmkey-page");
+    const body = make("div", "bpmkey-page-body");
+    const close = make("button", "bpmkey-page-close", "✕");
+    close.title = "Close (Esc)";
+    close.onclick = closeHarmonyPage;
+    root.append(close, body);
+    body.appendChild(make("p", "bpmkey-note", "Analyzing…"));
+    document.body.appendChild(root);
+    document.addEventListener("keydown", onPageKey);
+    page = root;
+
+    if (!cache.has(id)) request(id);
+    const [res, meta] = await Promise.all([loadChords(id), trackMeta(id)]);
+    if (page !== root) return; // closed or replaced while loading
+    body.replaceChildren();
+    if (!res) {
+      body.appendChild(make("p", null, "No audio analysis available for this track."));
+      return;
+    }
+    loopEnabled = false;
+    drawHarmony({ root, body, id, res, meta, ui: { edit: false, loop: false, sel: null } });
+  }
+
+  const CADENCE_NAMES = {
+    authentic: "authentic cadence (V → I)",
+    plagal: "plagal cadence (IV → I)",
+    deceptive: "deceptive cadence (V → vi)",
+    half: "half cadence (phrase ends on V)",
+  };
+
+  // Redraws the whole page from state; called again after edits, keeping the scroll position
+  function drawHarmony(view) {
+    const { root, body, id, res, meta, ui } = view;
+    const scroll = root.scrollTop;
+    clearInterval(pageTimer);
+    body.replaceChildren();
+    const redraw = () => drawHarmony(view);
+
+    const feat = cache.get(id);
+    const { tonic, minor } = res;
+    const spans = applyCorrections(res.spans, corrections[id]);
+    const rn = (c) => roman(c, tonic, minor);
+    const nm = (c) => spellChord(c, tonic, minor);
+    const tool = (text, title, onclick) => {
+      const b = make("button", "bpmkey-tool", text);
+      b.title = title;
+      b.onclick = onclick;
+      return b;
+    };
+
+    // Header
+    body.appendChild(make("h1", null, meta?.name ?? "Harmony analysis"));
+    if (meta?.artist) body.appendChild(make("p", "bpmkey-note", meta.artist));
+    const facts = [`Key ${spellKey(tonic, minor)} (via ${res.keySrc})`];
+    if (feat?.t) facts.push(`${Math.round(feat.t)} BPM`);
+    if (feat?.c) facts.push(feat.c);
+    body.appendChild(make("p", null, facts.join(" · ")));
+    const hints = flavorHints(spans, tonic, minor);
+    if (hints.length) body.appendChild(make("p", null, `Color: ${hints.join(" · ")}`));
+    body.appendChild(
+      make(
+        "p",
+        "bpmkey-note",
+        "Estimated from Spotify audio analysis (major/minor triads only, ~70% of the time right on reference songs). " +
+          "Roman numerals and functions assume the key above; fix wrong chords with ✎ Edit."
+      )
+    );
+
+    // Progressions
+    const progs = topProgressions(spans);
+    if (progs.length) {
+      body.appendChild(make("h2", null, "Progressions"));
+      for (const { chords, count } of progs) {
+        const row = make("p", "bpmkey-prog");
+        const play = make("button", "bpmkey-synth", "♪");
+        play.title = "Play this progression (synthesized)";
+        play.onclick = () => synthProgression(chords, feat?.t);
+        const fns = chords.map((c) => functionOf(c, tonic, minor) ?? "·").join(" ");
+        row.append(play, `${chords.map(nm).join(" → ")}`, make("small", null, `  ${chords.map(rn).join(" – ")}  [${fns}]  ×${count}`));
+        body.appendChild(row);
+      }
+    }
+
+    // Cadences
+    const cadences = findCadences(spans, tonic, minor, res.sections);
+    if (cadences.length) {
+      body.appendChild(make("h2", null, "Cadences"));
+      const counts = {};
+      for (const c of cadences) counts[c.type] = (counts[c.type] ?? 0) + 1;
+      body.appendChild(make("p", "bpmkey-note", Object.entries(counts).map(([t, n]) => `${t} ×${n}`).join(" · ")));
+      const list = make("div", "bpmkey-chips");
+      for (const { start, end, from, to, type } of cadences.slice(0, 24)) {
+        const b = make("button", "bpmkey-cadence", `${fmtTime(start)}  ${rn(from)}${to >= 0 ? ` → ${rn(to)}` : ""}`);
+        b.dataset.type = type;
+        b.title = `${CADENCE_NAMES[type]} · ${nm(from)}${to >= 0 ? ` → ${nm(to)}` : ""} · click to play`;
+        b.onclick = () => ((ui.sel = [start, end]), playSpan(id, start, end), markSelection());
+        list.appendChild(b);
+      }
+      body.appendChild(list);
+    }
+
+    // Chord usage
+    body.appendChild(make("h2", null, "Chord usage"));
+    for (const { chord, share } of chordUsage(spans).slice(0, 8)) {
+      const pct = `${Math.round(share * 100)}%`;
+      const track = make("div", "bpmkey-usage-track");
+      track.appendChild(make("div", "bpmkey-usage-bar")).style.width = pct;
+      const name = make("button", "bpmkey-synth", `♪ ${nm(chord)}`);
+      name.title = "Play this chord (synthesized)";
+      name.onclick = () => (stopSynth(), synthChord(chord));
+      const fn = functionOf(chord, tonic, minor);
+      const row = make("div", "bpmkey-usage-row");
+      row.append(name, make("small", null, `${rn(chord)}${fn ? ` ${fn}` : ""}`), track, make("small", null, pct));
+      body.appendChild(row);
+    }
+
+    // Timeline toolbar
+    body.appendChild(make("h2", null, "Timeline"));
+    const bar = make("div", "bpmkey-toolbar");
+    const editBtn = tool(ui.edit ? "✎ Editing — click a chord to fix it" : "✎ Edit", "Correct wrong chords", () => {
+      ui.edit = !ui.edit;
+      redraw();
+    });
+    editBtn.dataset.on = String(ui.edit);
+    const loopBtn = tool(ui.loop ? "⟲ Loop on" : "⟲ Loop off", "Repeat the selected chords (A–B loop)", () => {
+      ui.loop = loopEnabled = !ui.loop;
+      redraw();
+    });
+    loopBtn.dataset.on = String(ui.loop);
+    bar.append(editBtn, loopBtn);
+    if (ui.sel) bar.appendChild(make("span", "bpmkey-note", `selected ${fmtTime(ui.sel[0])}–${fmtTime(ui.sel[1])}`));
+    bar.appendChild(
+      tool("Copy .lab", "Copy the (corrected) chord timeline in .lab format", async () => {
+        const text = toLab(spans);
+        try {
+          await (Spicetify.Platform?.ClipboardAPI?.copy?.(text) ?? navigator.clipboard.writeText(text));
+          Spicetify.showNotification?.("Chord timeline copied (.lab)");
+        } catch {
+          Spicetify.showNotification?.("Copy failed", true);
+        }
+      })
+    );
+    const fixes = corrections[id]?.length ?? 0;
+    if (fixes) {
+      bar.appendChild(
+        tool(`Reset ${fixes} correction${fixes > 1 ? "s" : ""}`, "Forget your corrections for this track", () => {
+          clearCorrections(id);
+          redraw();
+        })
+      );
+    }
+    body.appendChild(bar);
+    body.appendChild(
+      make(
+        "p",
+        "bpmkey-note",
+        "Click a chord to play that part (Shift+click another chord to select a range). ♪ = the chord itself, synthesized. " +
+          "Border: blue = secondary dominant, orange = borrowed, red = chromatic. Dimmed = low confidence, ✓ = corrected."
+      )
+    );
+
+    // Chips by section
+    const merged = mergeSpans(spans);
+    const nextChord = (s) => merged.find(([ms, , c]) => ms > s && c >= 0)?.[2] ?? -1;
+    const chips = [];
+    const sections = res.sections.length ? res.sections : [[0, tonic, minor, 0]];
+    sections.forEach(([start, pc, secMinor, conf], si) => {
+      const end = sections[si + 1]?.[0] ?? Infinity;
+      const head = make("div", "bpmkey-section", `${fmtTime(start)}  ·  section key ${spellKey(pc, secMinor)}`);
+      if (conf < 0.3) head.dataset.state = "low";
+      const row = make("div", "bpmkey-chips");
+      for (const [s, e, c, cf, corrected] of spans.filter(([s]) => s >= start && s < end)) {
+        const info = explainChord(c, nextChord(s), tonic, minor);
+        const chip = make("div", "bpmkey-chip");
+        if (info) chip.dataset.kind = info.kind;
+        if (corrected) chip.dataset.corrected = "true";
+        else if (cf < LOW_CONFIDENCE) chip.dataset.state = "low";
+
+        if (ui.edit) {
+          const select = make("select", "bpmkey-edit");
+          const options = [[-1, "N (no chord)"], ...CHORDS.map((_, i) => [i, `${nm(i)}  ${rn(i)}`])];
+          for (const [value, text] of options) {
+            const o = make("option", null, text);
+            o.value = String(value);
+            o.selected = value === c;
+            select.appendChild(o);
+          }
+          select.onchange = () => {
+            setCorrection(id, s, e, Number(select.value));
+            redraw();
+          };
+          chip.appendChild(select);
+        } else {
+          const seg = make("button", "bpmkey-chip-play");
+          const sub = info?.label ?? `${rn(c)}${info?.fn ? ` ${info.fn}` : ""}`;
+          seg.append(make("span", null, `${nm(c)}${corrected ? " ✓" : ""}`), make("small", null, sub || " "));
+          seg.title = [
+            `${fmtTime(s)}–${fmtTime(e)}`,
+            info?.note,
+            corrected ? "corrected by you" : `confidence ${cf}`,
+            "click to play, Shift+click to extend the selection",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          seg.onclick = (ev) => {
+            ui.sel = ev.shiftKey && ui.sel ? [Math.min(ui.sel[0], s), Math.max(ui.sel[1], e)] : [s, e];
+            playSpan(id, ui.sel[0], ui.sel[1]);
+            markSelection();
+          };
+          chip.appendChild(seg);
+          if (c >= 0) {
+            const tone = make("button", "bpmkey-synth", "♪");
+            tone.title = `Play ${nm(c)} (synthesized)`;
+            tone.onclick = () => (stopSynth(), synthChord(c));
+            chip.appendChild(tone);
+          }
+        }
+        row.appendChild(chip);
+        chips.push([s, e, chip]);
+      }
+      body.append(head, row);
+    });
+
+    function markSelection() {
+      for (const [s, e, chip] of chips) {
+        const on = String(!!ui.sel && s >= ui.sel[0] && e <= ui.sel[1]);
+        if (chip.dataset.selected !== on) chip.dataset.selected = on;
+      }
+    }
+    const highlight = () => {
+      const t = currentTrackId() === id ? (Spicetify.Player.getProgress?.() ?? 0) / 1000 : -1;
+      for (const [s, e, chip] of chips) {
+        const on = String(t >= s && t < e);
+        if (chip.dataset.current !== on) chip.dataset.current = on;
+      }
+    };
+    markSelection();
+    highlight();
+    pageTimer = setInterval(highlight, 250);
+    root.scrollTop = scroll;
+  }
+
+  function registerContextMenu(tries = 0) {
+    if (!Spicetify.ContextMenu?.Item) {
+      if (tries < 50) setTimeout(() => registerContextMenu(tries + 1), 300);
+      return;
+    }
+    new Spicetify.ContextMenu.Item(
+      "Harmony analysis",
+      ([uri]) => openHarmonyPage(uri.split(":")[2]),
+      (uris) => uris.length === 1 && Spicetify.URI.isTrack(uris[0])
+    ).register();
+  }
+
+  const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
   // ---- rendering ----
 
   function setBadge(badge, feat) {
@@ -298,12 +1130,19 @@
       badge?.remove();
       return;
     }
-    if (!badge) {
-      const cells = row.querySelectorAll('[role="gridcell"]');
-      const last = cells[cells.length - 1];
-      if (!last) return;
-      badge = makeBadge("bpmkey-row");
-      last.prepend(badge);
+    const cells = row.querySelectorAll('[role="gridcell"]');
+    const last = cells[cells.length - 1];
+    if (!last) return;
+    // Rows like "Recommended" end with a narrow "Add" button cell instead of the duration;
+    // squeezing the badge in there wraps the button text, so use the previous cell instead
+    const buttonOnly = last.querySelector("button") && !/\d:\d\d/.test(last.textContent) && cells.length > 1;
+    const target = buttonOnly ? cells[cells.length - 2] : last;
+    if (!badge) badge = makeBadge("bpmkey-row");
+    // Virtualized rows get reused across row types, so move the badge if its cell changed
+    if (badge.parentElement !== target) {
+      badge.classList.toggle("bpmkey-row-inline", buttonOnly);
+      if (buttonOnly) target.appendChild(badge);
+      else target.prepend(badge);
     }
     if (!cache.has(id)) request(id);
     setBadge(badge, cache.get(id));
@@ -314,17 +1153,17 @@
       document.querySelector('[data-testid="now-playing-widget"]') ??
       document.querySelector(".main-nowPlayingWidget-nowPlaying");
     if (!widget) return;
-    const uri = Spicetify.Player.data?.item?.uri ?? Spicetify.Player.data?.track?.uri;
+    const id = currentTrackId();
     let badge = widget.querySelector(".bpmkey-now");
-    if (!uri || !Spicetify.URI.isTrack(uri)) {
+    if (!id) {
       badge?.remove();
       return;
     }
     if (!badge) {
       badge = makeBadge("bpmkey-now");
+      badge.onclick = () => openHarmonyPage(currentTrackId());
       widget.appendChild(badge);
     }
-    const id = uri.split(":")[2];
     if (!cache.has(id)) request(id);
     setBadge(badge, cache.get(id));
   }
@@ -353,8 +1192,63 @@
       white-space: nowrap;
     }
     .bpmkey-badge[data-state="loading"] { opacity: .4; }
-    .bpmkey-row { min-width: 104px; margin-right: 16px; text-align: right; }
-    .bpmkey-now { margin-left: 12px; }
+    .bpmkey-row { min-width: 104px; margin-right: 16px; text-align: right; flex-shrink: 0; }
+    .bpmkey-row-inline { margin-left: auto; }
+    [role="gridcell"]:has(> .bpmkey-row-inline) { display: flex; align-items: center; min-width: 0; }
+    [role="gridcell"]:has(> .bpmkey-row-inline) > :not(.bpmkey-row) { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .bpmkey-now { margin-left: 12px; cursor: pointer; }
+    .bpmkey-page {
+      position: fixed; inset: 0; z-index: 1000; overflow-y: auto; padding: 48px 32px;
+      background: var(--spice-main, #121212); color: var(--spice-text, #fff);
+    }
+    .bpmkey-page-body { max-width: 960px; margin: 0 auto; }
+    .bpmkey-page-close {
+      position: fixed; top: 16px; right: 24px; width: 32px; height: 32px; border: 0; border-radius: 50%;
+      background: var(--spice-card, #282828); color: var(--spice-text, #fff); cursor: pointer;
+    }
+    .bpmkey-page h1 { margin: 0 0 4px; font-size: 32px; }
+    .bpmkey-page h2 { margin: 28px 0 8px; font-size: 18px; }
+    .bpmkey-page p { margin: 0 0 8px; }
+    .bpmkey-prog small, .bpmkey-usage-row small { color: var(--spice-subtext, #b3b3b3); }
+    .bpmkey-usage-row { display: grid; grid-template-columns: 56px 40px 1fr 40px; gap: 8px; align-items: center; margin-bottom: 4px; }
+    .bpmkey-usage-track { height: 8px; border-radius: 4px; background: var(--spice-card, #282828); }
+    .bpmkey-usage-bar { height: 100%; border-radius: 4px; background: var(--spice-button, #1db954); }
+    .bpmkey-chip[data-state="low"], .bpmkey-section[data-state="low"] { opacity: .5; }
+    .bpmkey-chip[data-current="true"] { outline: 2px solid var(--spice-button, #1db954); opacity: 1; }
+    .bpmkey-note { font-size: 12px; color: var(--spice-subtext, #b3b3b3); }
+    .bpmkey-section { margin: 16px 0 6px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .bpmkey-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .bpmkey-chip {
+      display: flex; flex-direction: column; align-items: center; min-width: 48px; padding: 2px;
+      border-radius: 4px; background: var(--spice-card, #282828);
+    }
+    .bpmkey-chip-play {
+      display: flex; flex-direction: column; align-items: center; width: 100%; padding: 2px 4px;
+      border: 0; background: none; color: var(--spice-text, #fff); cursor: pointer;
+    }
+    .bpmkey-chip small { font-size: 10px; color: var(--spice-subtext, #b3b3b3); }
+    .bpmkey-synth {
+      border: 0; border-radius: 4px; padding: 0 6px; margin-right: 6px; background: none;
+      color: var(--spice-button, #1db954); cursor: pointer; font: inherit; text-align: left;
+    }
+    .bpmkey-chip .bpmkey-synth { margin: 0; font-size: 11px; }
+    .bpmkey-synth:hover, .bpmkey-chip-play:hover, .bpmkey-tool:hover, .bpmkey-cadence:hover { background: rgba(255, 255, 255, .1); }
+    .bpmkey-chip { border: 2px solid transparent; }
+    .bpmkey-chip[data-kind="secondary"] { border-color: #4f9dff; }
+    .bpmkey-chip[data-kind="borrowed"] { border-color: #ff9f43; }
+    .bpmkey-chip[data-kind="chromatic"] { border-color: #ff5c5c; }
+    .bpmkey-chip[data-selected="true"] { background: rgba(29, 185, 84, .25); }
+    .bpmkey-chip[data-corrected="true"] span { text-decoration: underline dotted; }
+    .bpmkey-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .bpmkey-tool, .bpmkey-cadence {
+      border: 1px solid var(--spice-subtext, #b3b3b3); border-radius: 14px; padding: 2px 10px;
+      background: none; color: var(--spice-text, #fff); cursor: pointer; font-size: 12px; font-variant-numeric: tabular-nums;
+    }
+    .bpmkey-tool[data-on="true"] { border-color: var(--spice-button, #1db954); color: var(--spice-button, #1db954); }
+    .bpmkey-cadence[data-type="authentic"] { border-color: #1db954; }
+    .bpmkey-cadence[data-type="plagal"] { border-color: #4f9dff; }
+    .bpmkey-cadence[data-type="deceptive"] { border-color: #ff9f43; }
+    .bpmkey-edit { background: var(--spice-main, #121212); color: var(--spice-text, #fff); border: 0; font: inherit; font-size: 12px; }
   `;
   document.head.appendChild(style);
 
@@ -367,21 +1261,41 @@
     attributeFilter: ["href"],
   });
   Spicetify.Player.addEventListener("songchange", schedule);
+  registerContextMenu();
   schedule();
 
   window.__bpmKey = {
     cache,
+    chordCache,
+    params: PARAMS,
+    analyzeChords,
+    topProgressions,
+    chordUsage,
+    chordName,
+    functionOf,
+    spellChord,
+    explainChord,
+    findCadences,
+    flavorHints,
+    applyCorrections,
+    toLab,
+    get corrections() {
+      return corrections;
+    },
+    openHarmonyPage,
     get strategy() {
       return strategy;
     },
     reset() {
       cache.clear();
+      chordCache.clear();
       strategy = null;
       disabled = false;
       detectFailures = 0;
       try {
         localStorage.removeItem(CACHE_KEY);
         localStorage.removeItem(STRATEGY_KEY);
+        localStorage.removeItem(CHORD_CACHE_KEY);
       } catch {}
       schedule();
     },

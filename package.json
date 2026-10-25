@@ -1,0 +1,10 @@
+{
+  "name": "spicetify-camelot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/unit.test.mjs",
+    "eval": "node test/eval.mjs",
+    "export-fixtures": "node scripts/export-fixtures.mjs"
+  }
+}
